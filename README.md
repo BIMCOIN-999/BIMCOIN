@@ -29,6 +29,36 @@ $1 of reserves held by a regulated issuer, and minting milestone bonuses in that
 would break the peg. Project payments should use an existing regulated stablecoin
 (USDC) held in a milestone escrow contract, which is the planned next component.
 
+## Paying for CBIONE and DaVinci with BIM
+
+CBIONE and DaVinci bill AI usage at 3x its AI cost, in US dollars. Customers can pay that bill
+in BIM. At launch BIM sells at $1, so $1 of AI cost costs 3 BIM.
+
+[`src/BIMCreditTopUp.sol`](src/BIMCreditTopUp.sol) handles the on-chain part:
+
+1. The billing backend measures usage, keeps each customer's USD credit balance, and signs a
+   15-minute quote: "this wallet pays exactly N BIM for $X of credit".
+2. The customer submits the quote (`pay`, or `payWithPermit` so a relayer can pay the gas).
+   The BIM moves straight from the customer to the revenue Safe; the contract never holds it.
+3. The backend credits the account when it sees the `PaymentSettled` event for its own quote.
+
+The contract refuses any quote below `minBimPerUsd` BIM per $1 of list price (1 BIM at launch),
+so even a compromised backend cannot sell credit for less. If BIM trades below $1, the backend
+quotes more BIM so the dollar price holds. Quotes are single-use, bound to the paying wallet and
+capped per payment, per day and per account.
+
+Governance: the contract's admin is a 48-hour `TimelockController` run by the governance Safe.
+Guardians (the ops Safe) can only stop things: pause, revoke the quote signer, lower the caps.
+The floor can be lowered at most 30% once every 30 days.
+
+```sh
+export BIMCOIN_ADDRESS=0x... GOVERNANCE_SAFE=0x... OPS_SAFE=0x... QUOTE_SIGNER=0x... REVENUE_SAFE=0x...
+forge script script/DeployBIMCreditTopUp.s.sol --rpc-url base_sepolia --account deployer --broadcast
+```
+
+Not in this repository: the price book, usage metering, the credit ledger, the quote signer and
+the payment watcher. They belong to the CBIONE and DaVinci backends.
+
 ## Develop
 
 Requires [Foundry](https://book.getfoundry.sh/getting-started/installation).

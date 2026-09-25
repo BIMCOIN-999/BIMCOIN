@@ -14,6 +14,11 @@ remappings = [
 [fuzz]
 runs = 1000
 
+[invariant]
+runs = 128
+depth = 64
+fail_on_revert = false
+
 [rpc_endpoints]
 base = "https://mainnet.base.org"
 base_sepolia = "https://sepolia.base.org"
