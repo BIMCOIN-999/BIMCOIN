@@ -2,7 +2,23 @@
 
 Smart contracts for BIMCOIN, the construction-finance token described in the BIMCOIN white paper.
 
-## The token
+## The live token is on Solana
+
+BIMCOIN already exists as a Solana SPL token:
+
+| | |
+|---|---|
+| Mint address | `8NPiM567PBD4izq1kK7DVnejSjEWgyUTn7bayvszBWsD` |
+| Name / symbol | BIMCOIN / BIM |
+| Supply | 21,000,000, fixed: mint authority revoked |
+| Freeze authority | Revoked |
+| Metadata | Immutable |
+| Liquidity pool | LP tokens 100% burned |
+
+The EVM contracts below are reference designs. Do not deploy `BIMCoin.sol` on any chain:
+it would create a second, unrelated token with the same name.
+
+## EVM reference token (not deployed)
 
 | | |
 |---|---|
@@ -32,9 +48,12 @@ would break the peg. Project payments should use an existing regulated stablecoi
 ## Paying for CBIONE and DaVinci with BIMCOIN
 
 CBIONE and DaVinci bill AI usage at 3x its AI cost, in US dollars. Customers can pay that bill
-in BIMCOIN. At launch BIMCOIN sells at $1, so $1 of AI cost costs 3 BIMCOIN.
+in BIMCOIN at the market price. BIMCOIN trades in a public pool that nobody can close, so a
+fixed rate such as "1 BIMCOIN = $1" would let customers buy BIMCOIN cheaply there and pay
+bills at a discount.
 
-[`src/BIMCreditTopUp.sol`](src/BIMCreditTopUp.sol) handles the on-chain part:
+[`src/BIMCreditTopUp.sol`](src/BIMCreditTopUp.sol) is an EVM reference design for the on-chain part.
+On Solana the same rules apply to each payment:
 
 1. The billing backend measures usage, keeps each customer's USD credit balance, and signs a
    15-minute quote: "this wallet pays exactly N BIMCOIN for $X of credit".
@@ -42,10 +61,10 @@ in BIMCOIN. At launch BIMCOIN sells at $1, so $1 of AI cost costs 3 BIMCOIN.
    The BIMCOIN moves straight from the customer to the revenue Safe; the contract never holds it.
 3. The backend credits the account when it sees the `PaymentSettled` event for its own quote.
 
-The contract refuses any quote below `minBimPerUsd` BIMCOIN per $1 of list price (1 BIMCOIN at launch),
-so even a compromised backend cannot sell credit for less. If BIMCOIN trades below $1, the backend
-quotes more BIMCOIN so the dollar price holds. Quotes are single-use, bound to the paying wallet and
-capped per payment, per day and per account.
+The backend converts the dollar amount at the current market price. The contract refuses any
+quote below `minBimPerUsd` BIMCOIN per $1 of list price (set at deployment), so even a
+compromised backend cannot sell credit for less. Quotes are single-use, bound to the paying
+wallet and capped per payment, per day and per account.
 
 Governance: the contract's admin is a 48-hour `TimelockController` run by the governance Safe.
 Guardians (the ops Safe) can only stop things: pause, revoke the quote signer, lower the caps.
@@ -70,32 +89,22 @@ forge build
 forge test
 ```
 
-## Deploy
+## Deploy to a testnet (reference designs only)
 
-Always deploy to a testnet first. The treasury receives all 21,000,000 BIMCOIN, so it
-should be a multisig wallet such as a [Safe](https://safe.global), never a single
-personal wallet.
+Deploy the EVM contracts only to testnets, to try out the billing flow. The live BIMCOIN is
+the Solana token above.
 
 ```sh
 # 1. Store the deployer key in an encrypted keystore (never in a file or shell history)
 cast wallet import deployer --interactive
 
-# 2. Choose the treasury
-export BIMCOIN_TREASURY=0xYourSafeAddress
+# 2. Choose the test treasury
+export BIMCOIN_TREASURY=0xYourTestWallet
 
-# 3. Deploy to Base Sepolia (testnet). The deployer wallet needs a little test ETH.
+# 3. Deploy to Base Sepolia. The deployer wallet needs a little test ETH.
 forge script script/DeployBIMCoin.s.sol \
-  --rpc-url base_sepolia --account deployer --broadcast \
-  --verify --etherscan-api-key "$ETHERSCAN_API_KEY"
-
-# 4. Mainnet: the same command with --rpc-url base
+  --rpc-url base_sepolia --account deployer --broadcast
 ```
 
-The deployment is permanent. Name, symbol and supply cannot be changed afterwards, so
-confirm them in `src/BIMCoin.sol` before the mainnet deployment.
-
-### Before the mainnet deployment
-
-- Get legal advice on how BIMCOIN will be offered. A token sold with an expected return from
-  the founders' work is likely to be treated as a security.
-- Create the treasury Safe and decide who its signers are.
+Before selling or promoting BIMCOIN, get legal advice on how it is offered. A token sold
+with an expected return from the founders' work is likely to be treated as a security.
