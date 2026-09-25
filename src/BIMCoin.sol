@@ -16,7 +16,7 @@ contract BIMCoin is ERC20, ERC20Permit, ERC20Votes {
 
     error ZeroTreasury();
 
-    constructor(address treasury) ERC20("BIMCOIN", "BIM") ERC20Permit("BIMCOIN") {
+    constructor(address treasury) ERC20("BIMCOIN", "BIMCOIN") ERC20Permit("BIMCOIN") {
         if (treasury == address(0)) revert ZeroTreasury();
         _mint(treasury, MAX_SUPPLY);
     }

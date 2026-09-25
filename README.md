@@ -6,15 +6,15 @@ Smart contracts for BIMCOIN, the construction-finance token described in the BIM
 
 | | |
 |---|---|
-| Name / symbol | BIMCOIN / BIM |
+| Name / symbol | BIMCOIN / BIMCOIN |
 | Standard | ERC-20 with EIP-2612 permit and ERC20Votes (for DAO governance) |
-| Supply | 21,000,000 BIM, fixed |
+| Supply | 21,000,000 BIMCOIN, fixed |
 | Decimals | 18 |
 | Chains | Any EVM chain. Recommended: Base |
 
 The entire supply is minted once, at deployment, to a treasury address. The contract has
 no mint function, owner, pause or blacklist, so after deployment nobody, including the
-founders, can create more BIM or freeze anyone's balance. Voting power is tracked by
+founders, can create more BIMCOIN or freeze anyone's balance. Voting power is tracked by
 timestamp (`CLOCK_MODE() == "mode=timestamp"`) so a future Governor contract behaves the
 same on every chain.
 
@@ -29,22 +29,22 @@ $1 of reserves held by a regulated issuer, and minting milestone bonuses in that
 would break the peg. Project payments should use an existing regulated stablecoin
 (USDC) held in a milestone escrow contract, which is the planned next component.
 
-## Paying for CBIONE and DaVinci with BIM
+## Paying for CBIONE and DaVinci with BIMCOIN
 
 CBIONE and DaVinci bill AI usage at 3x its AI cost, in US dollars. Customers can pay that bill
-in BIM. At launch BIM sells at $1, so $1 of AI cost costs 3 BIM.
+in BIMCOIN. At launch BIMCOIN sells at $1, so $1 of AI cost costs 3 BIMCOIN.
 
 [`src/BIMCreditTopUp.sol`](src/BIMCreditTopUp.sol) handles the on-chain part:
 
 1. The billing backend measures usage, keeps each customer's USD credit balance, and signs a
-   15-minute quote: "this wallet pays exactly N BIM for $X of credit".
+   15-minute quote: "this wallet pays exactly N BIMCOIN for $X of credit".
 2. The customer submits the quote (`pay`, or `payWithPermit` so a relayer can pay the gas).
-   The BIM moves straight from the customer to the revenue Safe; the contract never holds it.
+   The BIMCOIN moves straight from the customer to the revenue Safe; the contract never holds it.
 3. The backend credits the account when it sees the `PaymentSettled` event for its own quote.
 
-The contract refuses any quote below `minBimPerUsd` BIM per $1 of list price (1 BIM at launch),
-so even a compromised backend cannot sell credit for less. If BIM trades below $1, the backend
-quotes more BIM so the dollar price holds. Quotes are single-use, bound to the paying wallet and
+The contract refuses any quote below `minBimPerUsd` BIMCOIN per $1 of list price (1 BIMCOIN at launch),
+so even a compromised backend cannot sell credit for less. If BIMCOIN trades below $1, the backend
+quotes more BIMCOIN so the dollar price holds. Quotes are single-use, bound to the paying wallet and
 capped per payment, per day and per account.
 
 Governance: the contract's admin is a 48-hour `TimelockController` run by the governance Safe.
@@ -72,7 +72,7 @@ forge test
 
 ## Deploy
 
-Always deploy to a testnet first. The treasury receives all 21,000,000 BIM, so it
+Always deploy to a testnet first. The treasury receives all 21,000,000 BIMCOIN, so it
 should be a multisig wallet such as a [Safe](https://safe.global), never a single
 personal wallet.
 
@@ -96,7 +96,6 @@ confirm them in `src/BIMCoin.sol` before the mainnet deployment.
 
 ### Before the mainnet deployment
 
-- Get legal advice on how BIM will be offered. A token sold with an expected return from
+- Get legal advice on how BIMCOIN will be offered. A token sold with an expected return from
   the founders' work is likely to be treated as a security.
-- Confirm the `BIM` ticker is not already used by a listed token.
 - Create the treasury Safe and decide who its signers are.

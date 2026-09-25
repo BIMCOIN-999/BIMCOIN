@@ -18,7 +18,7 @@ contract BIMCoinTest is Test {
 
     function test_Metadata() public view {
         assertEq(token.name(), "BIMCOIN");
-        assertEq(token.symbol(), "BIM");
+        assertEq(token.symbol(), "BIMCOIN");
         assertEq(token.decimals(), 18);
     }
 
