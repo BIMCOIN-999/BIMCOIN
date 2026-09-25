@@ -10,15 +10,16 @@ import {BIMCreditTopUp} from "../src/BIMCreditTopUp.sol";
 
 /// @notice Deploys a 48-hour TimelockController controlled by the governance Safe, then
 ///         BIMCreditTopUp with that timelock as its admin.
-/// @dev Required env: BIMCOIN_ADDRESS, GOVERNANCE_SAFE, OPS_SAFE, QUOTE_SIGNER, REVENUE_SAFE, and
-///      MIN_BIM_PER_USD: the floor in BIM wei (18 decimals) per US$1 of list price. Set it below the
-///      market amount at deployment, e.g. BIM at $0.50 (2 BIM per $1) => 1.6e18.
+/// @dev Required env: BIMCOIN_ADDRESS, GOVERNANCE_SAFE, OPS_SAFE, QUOTE_SIGNER, REVENUE_SAFE,
+///      MARKET_BIM_PER_USD (the market amount at deployment, in BIM wei per US$1) and
+///      MIN_BIM_PER_USD (the floor, same unit), which must lie between 50% and 100% of the market
+///      amount. Example: BIM at $0.50 => market 2e18, floor 1.6e18.
 ///      Optional env: MAX_USD_CENTS_PER_PAYMENT / _PER_DAY / _PER_ACCOUNT_PER_PERIOD (defaults
 ///      $2k / $20k / $5k) and ALLOW_EOA_SAFES=true on testnets where plain wallets stand in for Safes.
 contract DeployBIMCreditTopUp is Script {
     uint256 internal constant TIMELOCK_DELAY = 48 hours;
     uint48 internal constant ADMIN_TRANSFER_DELAY = 3 days;
-    uint256 internal constant MIN_SANE_FLOOR = 1e12; // below this the value was almost certainly not in wei
+    uint256 internal constant MIN_SANE_AMOUNT = 1e12; // below this the value was almost certainly not in wei
     uint256 internal constant MAX_SANE_CAP_CENTS = 1e8; // $1M
 
     struct Config {
@@ -27,6 +28,7 @@ contract DeployBIMCreditTopUp is Script {
         address opsSafe;
         address quoteSigner;
         address revenueSafe;
+        uint256 marketBimPerUsd;
         uint256 minBimPerUsd;
         BIMCreditTopUp.Limits limits;
         bool allowEoaSafes;
@@ -36,6 +38,7 @@ contract DeployBIMCreditTopUp is Script {
         Config memory c = readConfig();
         validate(c);
         console.log("chainid:", block.chainid);
+        console.log("marketBimPerUsd (BIM wei per US$1 of list price):", c.marketBimPerUsd);
         console.log("minBimPerUsd (BIM wei per US$1 of list price):", c.minBimPerUsd);
         console.log("caps in US cents (payment, day, account per 30 days):");
         console.log(c.limits.maxUsdCentsPerPayment, c.limits.maxUsdCentsPerDay, c.limits.maxUsdCentsPerAccountPerPeriod);
@@ -54,6 +57,7 @@ contract DeployBIMCreditTopUp is Script {
         c.opsSafe = vm.envAddress("OPS_SAFE");
         c.quoteSigner = vm.envAddress("QUOTE_SIGNER");
         c.revenueSafe = vm.envAddress("REVENUE_SAFE");
+        c.marketBimPerUsd = vm.envUint("MARKET_BIM_PER_USD");
         c.minBimPerUsd = vm.envUint("MIN_BIM_PER_USD");
         c.limits = BIMCreditTopUp.Limits({
             maxUsdCentsPerPayment: SafeCast.toUint64(_envUintOr("MAX_USD_CENTS_PER_PAYMENT", 2_000_00)),
@@ -67,6 +71,10 @@ contract DeployBIMCreditTopUp is Script {
 
     /// @notice Rejects configurations that would deploy an unusable or unsafe contract.
     function validate(Config memory c) public view {
+        require(
+            c.governanceSafe != address(0) && c.opsSafe != address(0) && c.revenueSafe != address(0),
+            "a Safe address is zero"
+        );
         require(address(c.bim).code.length > 0, "BIMCOIN_ADDRESS has no code on this chain");
         require(IERC20Metadata(address(c.bim)).decimals() == 18, "BIMCOIN_ADDRESS is not an 18-decimal token");
         require(c.quoteSigner.code.length == 0, "QUOTE_SIGNER must be a plain key (EOA), not a contract");
@@ -80,7 +88,9 @@ contract DeployBIMCreditTopUp is Script {
                 "a Safe address has no code; set ALLOW_EOA_SAFES=true only on testnets"
             );
         }
-        require(c.minBimPerUsd >= MIN_SANE_FLOOR, "MIN_BIM_PER_USD must be in BIM wei (18 decimals) per US$1");
+        require(c.marketBimPerUsd >= MIN_SANE_AMOUNT, "MARKET_BIM_PER_USD must be in BIM wei (18 decimals) per US$1");
+        require(c.minBimPerUsd <= c.marketBimPerUsd, "MIN_BIM_PER_USD above the market amount would overcharge");
+        require(c.minBimPerUsd * 2 >= c.marketBimPerUsd, "MIN_BIM_PER_USD below half the market amount protects little");
         BIMCreditTopUp.Limits memory l = c.limits;
         require(l.maxUsdCentsPerPayment > 0, "payment cap is zero");
         require(l.maxUsdCentsPerPayment <= l.maxUsdCentsPerAccountPerPeriod, "payment cap above account cap");

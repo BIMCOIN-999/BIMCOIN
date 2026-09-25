@@ -19,12 +19,12 @@ import {
 ///         floor of `minBimPerUsd` BIM per US$1 of list price, single-use orders, payer binding,
 ///         and USD caps. It never holds BIM: every payment moves straight from the payer to
 ///         `revenueSafe` in the same transaction.
-///         The floor is a safety net, not the price: it stops even a compromised backend from
-///         crediting more than $1 per `minBimPerUsd` BIM.
+///         The floor is a safety net, not the price: a leaked quote-signing key cannot settle a
+///         payment below it. It does not bound the backend's own credit ledger.
 /// @dev Admin (DEFAULT_ADMIN_ROLE) = an OpenZeppelin TimelockController (48 h) whose proposer,
 ///      executor and canceller is the ConstruBIM Safe. GUARDIAN_ROLE (ops Safe) can only stop
-///      things: pause, revoke the quote signer, cancel an order, lower caps. RELAYER_ROLE
-///      (granted by the admin) may submit `payWithPermit` on behalf of payers.
+///      things: pause, revoke the quote signer or a relayer, cancel an order, lower caps.
+///      RELAYER_ROLE (granted by the admin) may submit `payWithPermit` on behalf of payers.
 contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     using SafeERC20 for IERC20;
 
@@ -40,15 +40,18 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
 
     /// @dev The daily and per-account caps are leaky buckets: each payment adds its USD value and
     ///      the level drains linearly at cap/window per second. A burst can never exceed the cap,
-    ///      and any span of t seconds settles at most cap * (1 + t / window).
+    ///      and any span of t seconds settles at most cap * (1 + t / window): just under 2x the
+    ///      cap over one full window.
     struct Limits {
         uint64 maxUsdCentsPerPayment;
         uint64 maxUsdCentsPerDay; // all accounts; window 1 day
         uint64 maxUsdCentsPerAccountPerPeriod; // per accountRef; window ACCOUNT_PERIOD
     }
 
+    /// @dev `level` is in cent-seconds (US cents x window length) so draining is exact: it falls
+    ///      by `cap` per second, with no rounding loss however often the bucket is updated.
     struct Bucket {
-        uint192 level; // USD cents
+        uint192 level;
         uint64 updatedAt;
     }
 
@@ -60,9 +63,9 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     uint64 public constant MAX_QUOTE_TTL = 30 minutes;
     uint64 public constant MAX_CLOCK_SKEW = 1 minutes;
     uint256 public constant MAX_FLOOR_DECREASE_BPS = 3_000; // at most -30% per step
-    uint256 public constant FLOOR_DECREASE_INTERVAL = 30 days; // at most one decrease per 30 days
+    uint256 public constant FLOOR_DECREASE_INTERVAL = 7 days; // at most one decrease per 7 days
     uint256 public constant FLOOR_RAISE_INTERVAL = 7 days; // at most one raise (<= 2x) per 7 days
-    uint256 public constant FLOOR_UNDO_WINDOW = 90 days; // a recent raise can be undone without limits
+    uint256 public constant FLOOR_UNDO_WINDOW = 90 days; // recent raises can be undone without limits
     uint256 public constant DAY = 1 days;
     uint256 public constant ACCOUNT_PERIOD = 30 days;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
@@ -70,7 +73,7 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     IERC20 public immutable BIM;
 
     uint256 public minBimPerUsd;
-    uint256 public floorBeforeLastRaise;
+    uint256 public floorBeforeRaises; // lowest floor before the current series of raises
     uint64 public lastFloorDecreaseAt;
     uint64 public lastFloorRaiseAt;
     address public quoteSigner;
@@ -120,6 +123,7 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     error FloorRaiseTooSoon(uint256 nextAllowedAt);
     error LimitNotTightened();
     error NotGuardianOrAdmin(address caller);
+    error PermitNotBoundToQuote(uint256 maxBim, uint256 permitDeadline);
 
     modifier onlyGuardianOrAdmin() {
         _checkGuardianOrAdmin();
@@ -147,7 +151,7 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
         quoteSigner = quoteSigner_;
         emit QuoteSignerUpdated(address(0), quoteSigner_);
         minBimPerUsd = initialMinBimPerUsd;
-        floorBeforeLastRaise = initialMinBimPerUsd;
+        floorBeforeRaises = initialMinBimPerUsd;
         lastFloorDecreaseAt = uint64(block.timestamp);
         emit MinBimPerUsdUpdated(0, initialMinBimPerUsd);
         _setLimits(initialLimits);
@@ -163,10 +167,11 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     }
 
     /// @notice Pay with an EIP-2612 permit (value = maxBim) so an approved relayer can pay the gas.
-    /// @dev Only the payer or a RELAYER_ROLE holder may call. A permit is not bound to a quote, so
-    ///      letting anyone submit it would let a third party pair a leftover permit with another
-    ///      of the payer's open quotes. If the permit fails (front-run or invalid), only the payer
-    ///      may continue on an existing allowance: a relayer never spends a standing allowance.
+    /// @dev Only the payer or a RELAYER_ROLE holder may call. An EIP-2612 permit cannot name the
+    ///      order it pays for, so a relayer must submit a permit for exactly the quote's amount
+    ///      that expires no later than the quote. If the permit fails (front-run or invalid), only
+    ///      the payer may continue on an existing allowance: a relayer never spends a standing
+    ///      allowance.
     function payWithPermit(
         Quote calldata q,
         bytes calldata signature,
@@ -176,7 +181,12 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
         bytes32 r,
         bytes32 s
     ) external whenNotPaused {
-        if (msg.sender != q.payer && !hasRole(RELAYER_ROLE, msg.sender)) revert NotPayer(msg.sender, q.payer);
+        if (msg.sender != q.payer) {
+            if (!hasRole(RELAYER_ROLE, msg.sender)) revert NotPayer(msg.sender, q.payer);
+            if (maxBim != q.bimAmount || permitDeadline > q.expiresAt) {
+                revert PermitNotBoundToQuote(maxBim, permitDeadline);
+            }
+        }
         try IERC20Permit(address(BIM)).permit(q.payer, address(this), maxBim, permitDeadline, v, r, s) {}
         catch {
             if (msg.sender != q.payer) revert NotPayer(msg.sender, q.payer);
@@ -201,14 +211,12 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
 
     /// @notice USD cents that can still settle right now across all accounts.
     function availableUsdCentsToday() external view returns (uint256) {
-        uint64 cap = limits.maxUsdCentsPerDay;
-        return cap - Math.min(cap, _drainedLevel(dailyBucket, cap, DAY));
+        return _available(dailyBucket, limits.maxUsdCentsPerDay, DAY);
     }
 
     /// @notice USD cents `accountRef` can still settle right now (ignoring the daily cap).
     function availableUsdCentsForAccount(bytes32 accountRef) external view returns (uint256) {
-        uint64 cap = limits.maxUsdCentsPerAccountPerPeriod;
-        return cap - Math.min(cap, _drainedLevel(accountBuckets[accountRef], cap, ACCOUNT_PERIOD));
+        return _available(accountBuckets[accountRef], limits.maxUsdCentsPerAccountPerPeriod, ACCOUNT_PERIOD);
     }
 
     function _settle(Quote calldata q, bytes calldata signature, uint256 maxBim) private {
@@ -241,23 +249,35 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     function _consumeLimits(bytes32 accountRef, uint64 usdCents) private {
         Limits memory l = limits;
         if (usdCents > l.maxUsdCentsPerPayment) revert PaymentTooLarge(usdCents, l.maxUsdCentsPerPayment);
-        uint256 dayLevel = _drainedLevel(dailyBucket, l.maxUsdCentsPerDay, DAY) + usdCents;
-        if (dayLevel > l.maxUsdCentsPerDay) revert DailyCapExceeded(dayLevel, l.maxUsdCentsPerDay);
-        uint256 accountLevel =
-            _drainedLevel(accountBuckets[accountRef], l.maxUsdCentsPerAccountPerPeriod, ACCOUNT_PERIOD) + usdCents;
-        if (accountLevel > l.maxUsdCentsPerAccountPerPeriod) {
-            revert AccountCapExceeded(accountRef, accountLevel, l.maxUsdCentsPerAccountPerPeriod);
+        uint256 dayLevel = _drainedLevel(dailyBucket, l.maxUsdCentsPerDay, DAY) + uint256(usdCents) * DAY;
+        if (dayLevel > uint256(l.maxUsdCentsPerDay) * DAY) {
+            revert DailyCapExceeded(Math.ceilDiv(dayLevel, DAY), l.maxUsdCentsPerDay);
         }
-        // Both levels are at most a uint64 cap, so the casts cannot truncate.
+        uint256 accountLevel = _drainedLevel(
+            accountBuckets[accountRef], l.maxUsdCentsPerAccountPerPeriod, ACCOUNT_PERIOD
+        ) + uint256(usdCents) * ACCOUNT_PERIOD;
+        if (accountLevel > uint256(l.maxUsdCentsPerAccountPerPeriod) * ACCOUNT_PERIOD) {
+            revert AccountCapExceeded(
+                accountRef, Math.ceilDiv(accountLevel, ACCOUNT_PERIOD), l.maxUsdCentsPerAccountPerPeriod
+            );
+        }
+        // Levels are at most cap (< 2^64) x window (< 2^22), so they fit in uint192.
         // forge-lint: disable-next-line(unsafe-typecast)
         dailyBucket = Bucket({level: uint192(dayLevel), updatedAt: uint64(block.timestamp)});
         // forge-lint: disable-next-line(unsafe-typecast)
         accountBuckets[accountRef] = Bucket({level: uint192(accountLevel), updatedAt: uint64(block.timestamp)});
     }
 
+    /// @dev Current level in cent-seconds. A level above the current cap (after a cap was
+    ///      lowered) is first limited to the cap, so a lowered cap throttles instead of freezing.
     function _drainedLevel(Bucket memory b, uint256 cap, uint256 window) private view returns (uint256) {
-        uint256 drained = Math.mulDiv(cap, block.timestamp - b.updatedAt, window);
-        return b.level > drained ? b.level - drained : 0;
+        uint256 level = Math.min(b.level, cap * window);
+        uint256 drained = cap * (block.timestamp - b.updatedAt);
+        return level > drained ? level - drained : 0;
+    }
+
+    function _available(Bucket memory b, uint256 cap, uint256 window) private view returns (uint256) {
+        return (cap * window - _drainedLevel(b, cap, window)) / window;
     }
 
     // --------------------------------------------------------- guardian (stop-only)
@@ -272,10 +292,17 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     }
 
     /// @notice Void one open quote, e.g. after the BIM price moved, without pausing every payment.
+    /// @dev An already-settled order is skipped rather than reverting, so a Safe batch cancelling
+    ///      many stale quotes still goes through if a payer settles one of them first.
     function cancelOrder(bytes32 orderId) external onlyGuardianOrAdmin {
-        if (settled[orderId]) revert OrderAlreadySettled(orderId);
+        if (settled[orderId]) return;
         cancelled[orderId] = true;
         emit OrderCancelled(orderId);
+    }
+
+    /// @notice Stop a leaked or misbehaving relayer without pausing every payment.
+    function revokeRelayer(address relayer) external onlyGuardianOrAdmin {
+        _revokeRole(RELAYER_ROLE, relayer);
     }
 
     function tightenLimits(Limits calldata l) external onlyGuardianOrAdmin {
@@ -294,8 +321,8 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
     }
 
     /// @notice Raise the floor by at most 2x, once per 7 days. Lower it by at most 30%, once per
-    ///         30 days, except that within 90 days of a raise it may return to any value not below
-    ///         the floor before that raise.
+    ///         7 days, except that within 90 days of the latest raise it may return to any value not
+    ///         below the lowest floor in effect before the current series of raises.
     function setMinBimPerUsd(uint256 newFloor) external onlyRole(DEFAULT_ADMIN_ROLE) {
         uint256 current = minBimPerUsd;
         if (newFloor == current) revert FloorUnchanged();
@@ -305,7 +332,11 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
                 uint256 nextRaiseAt = uint256(lastFloorRaiseAt) + FLOOR_RAISE_INTERVAL;
                 if (block.timestamp < nextRaiseAt) revert FloorRaiseTooSoon(nextRaiseAt);
             }
-            floorBeforeLastRaise = current;
+            // Start a new series if the previous raise can no longer be undone; otherwise keep the
+            // lowest pre-raise floor, so a multi-step raise can be undone in one step.
+            if (block.timestamp > uint256(lastFloorRaiseAt) + FLOOR_UNDO_WINDOW || current < floorBeforeRaises) {
+                floorBeforeRaises = current;
+            }
             lastFloorRaiseAt = uint64(block.timestamp);
         } else if (!_isUndoOfRecentRaise(newFloor)) {
             if (newFloor * 10_000 < current * (10_000 - MAX_FLOOR_DECREASE_BPS)) {
@@ -342,7 +373,7 @@ contract BIMCreditTopUp is EIP712, AccessControlDefaultAdminRules, Pausable {
 
     function _isUndoOfRecentRaise(uint256 newFloor) private view returns (bool) {
         return lastFloorRaiseAt != 0 && block.timestamp <= uint256(lastFloorRaiseAt) + FLOOR_UNDO_WINDOW
-            && newFloor >= floorBeforeLastRaise;
+            && newFloor >= floorBeforeRaises;
     }
 
     function _checkGuardianOrAdmin() private view {

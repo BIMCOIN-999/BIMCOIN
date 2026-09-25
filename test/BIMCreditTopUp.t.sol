@@ -360,7 +360,7 @@ contract BIMCreditTopUpTest is Base {
         topUp.payWithPermit(q, sig, 100e18, block.timestamp + 1 hours, 27, bytes32(0), bytes32(0));
         vm.prank(relayer); // even an approved relayer cannot fall back to the allowance
         vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.NotPayer.selector, relayer, payer));
-        topUp.payWithPermit(q, sig, 100e18, block.timestamp + 1 hours, 27, bytes32(0), bytes32(0));
+        topUp.payWithPermit(q, sig, 100e18, q.expiresAt, 27, bytes32(0), bytes32(0));
         assertEq(bim.balanceOf(payer), 1_000_000e18);
     }
 
@@ -583,9 +583,9 @@ contract BIMCreditTopUpTest is Base {
         BIMCreditTopUp.Quote memory fresh = _quote("fresh", 150e18, 10_000);
         _approveAndPay(fresh);
         assertTrue(topUp.settled(fresh.orderId));
-        vm.prank(guardian);
-        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.OrderAlreadySettled.selector, fresh.orderId));
+        vm.prank(guardian); // skipped, so a Safe batch of cancellations is not undone by one settlement
         topUp.cancelOrder(fresh.orderId);
+        assertFalse(topUp.cancelled(fresh.orderId));
     }
 
     // ------------------------------------------------------ admin recovery
@@ -643,7 +643,7 @@ contract BIMCreditTopUpTest is Base {
         vm.expectPartialRevert(UNAUTHORIZED);
         topUp.setMinBimPerUsd(0.7e18);
 
-        // lowering is not allowed within 30 days of launch
+        // lowering is not allowed within 7 days of launch
         bytes memory lower = abi.encodeCall(BIMCreditTopUp.setMinBimPerUsd, (0.7e18));
         vm.prank(safe);
         timelock.schedule(address(topUp), 0, lower, bytes32(0), "early", 48 hours);
@@ -666,7 +666,7 @@ contract BIMCreditTopUpTest is Base {
         vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorStepTooLarge.selector, 2e18, 1.4e18 - 1));
         topUp.setMinBimPerUsd(1.4e18 - 1);
         topUp.setMinBimPerUsd(1.4e18);
-        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorDecreaseTooSoon.selector, block.timestamp + 30 days));
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorDecreaseTooSoon.selector, block.timestamp + 7 days));
         topUp.setMinBimPerUsd(1.3e18);
         vm.expectRevert(BIMCreditTopUp.FloorUnchanged.selector);
         topUp.setMinBimPerUsd(1.4e18);
@@ -691,9 +691,159 @@ contract BIMCreditTopUpTest is Base {
         topUp.setMinBimPerUsd(2e18);
         topUp.setMinBimPerUsd(1e18); // back to the pre-raise floor, same day, no -30% limit
         assertEq(topUp.minBimPerUsd(), 1e18);
-        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorDecreaseTooSoon.selector, 1_790_000_000 + 30 days));
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorDecreaseTooSoon.selector, 1_790_000_000 + 7 days));
         topUp.setMinBimPerUsd(0.9e18); // below the pre-raise floor: normal rules
         vm.stopPrank();
+    }
+
+    /// A defensive series of raises (each at most 2x per 7 days) can be undone in one step.
+    function test_UndoAfterSeriesOfRaisesReturnsToOriginalFloor() public {
+        vm.startPrank(address(timelock));
+        topUp.setMinBimPerUsd(2e18);
+        vm.warp(block.timestamp + 7 days);
+        topUp.setMinBimPerUsd(4e18);
+        vm.warp(block.timestamp + 7 days);
+        topUp.setMinBimPerUsd(8e18);
+        vm.warp(block.timestamp + 14 days);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorStepTooLarge.selector, 8e18, 0.9e18));
+        topUp.setMinBimPerUsd(0.9e18); // below the floor before the series: normal rules
+        topUp.setMinBimPerUsd(1e18);
+        vm.stopPrank();
+        assertEq(topUp.minBimPerUsd(), 1e18);
+    }
+
+    function test_UndoWindowIs90Days() public {
+        uint256 t0 = block.timestamp;
+        vm.startPrank(address(timelock));
+        topUp.setMinBimPerUsd(2e18);
+        vm.warp(t0 + 90 days);
+        topUp.setMinBimPerUsd(1e18); // last second of the window
+        vm.warp(t0 + 97 days);
+        topUp.setMinBimPerUsd(2e18); // new raise, new series from 1e18
+        vm.warp(t0 + 97 days + 90 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.FloorStepTooLarge.selector, 2e18, 1e18));
+        topUp.setMinBimPerUsd(1e18); // window over: -50% is not allowed
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_ZeroAmount() public {
+        BIMCreditTopUp.Quote memory q = _quote("z1", 100e18, 0);
+        bytes memory sig = _sign(q);
+        vm.startPrank(payer);
+        bim.approve(address(topUp), type(uint256).max);
+        vm.expectRevert(BIMCreditTopUp.ZeroAmount.selector);
+        topUp.pay(q, sig, q.bimAmount);
+        q = _quote("z2", 0, 10_000);
+        sig = _sign(q);
+        vm.expectRevert(BIMCreditTopUp.ZeroAmount.selector);
+        topUp.pay(q, sig, 0);
+        vm.stopPrank();
+    }
+
+    function test_FloorRoundsUp() public {
+        vm.prank(address(timelock));
+        topUp.setMinBimPerUsd(1e18 + 1);
+        assertEq(topUp.minimumBimFor(1), 1e16 + 1);
+        BIMCreditTopUp.Quote memory q = _quote("r1", 1e16, 1);
+        bytes memory sig = _sign(q);
+        vm.startPrank(payer);
+        bim.approve(address(topUp), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.BelowMinimumRate.selector, 1e16, 1e16 + 1));
+        topUp.pay(q, sig, q.bimAmount);
+        vm.stopPrank();
+        _approveAndPay(_quote("r2", 1e16 + 1, 1));
+        assertTrue(topUp.settled("r2"));
+    }
+
+    function test_ExpiryBoundary() public {
+        BIMCreditTopUp.Quote memory q = _quote("e1", 100e18, 10_000);
+        bytes memory sig = _sign(q);
+        BIMCreditTopUp.Quote memory late = _quote("e2", 100e18, 10_000);
+        bytes memory lateSig = _sign(late);
+        vm.startPrank(payer);
+        bim.approve(address(topUp), type(uint256).max);
+        vm.warp(q.expiresAt);
+        topUp.pay(q, sig, 100e18); // the expiry second itself is still valid
+        vm.warp(late.expiresAt + 1);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.QuoteExpired.selector, late.expiresAt));
+        topUp.pay(late, lateSig, 100e18);
+        vm.stopPrank();
+    }
+
+    function test_DailyCapRefillsAndCanBeUsedAgain() public {
+        for (uint256 i; i < 10; ++i) {
+            _payAs(bytes32(i + 1), keccak256(abi.encode("org", i)), 2_000_00);
+        }
+        vm.warp(block.timestamp + 1 days);
+        assertEq(topUp.availableUsdCentsToday(), PER_DAY);
+        for (uint256 i; i < 10; ++i) {
+            _payAs(bytes32(i + 11), keccak256(abi.encode("org", i)), 2_000_00);
+        }
+        assertEq(topUp.availableUsdCentsToday(), 0);
+        BIMCreditTopUp.Quote memory q = _quoteFor("late", keccak256("org-late"), 1);
+        bytes memory sig = _sign(q);
+        vm.startPrank(payer);
+        bim.approve(address(topUp), q.bimAmount);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.DailyCapExceeded.selector, PER_DAY + 1, PER_DAY));
+        topUp.pay(q, sig, q.bimAmount);
+        vm.stopPrank();
+    }
+
+    /// Lowering a cap throttles payments right away instead of freezing them for days.
+    function test_LoweringDailyCapThrottlesImmediately() public {
+        for (uint256 i; i < 10; ++i) {
+            _payAs(bytes32(i + 1), keccak256(abi.encode("org", i)), 2_000_00);
+        }
+        vm.prank(guardian);
+        topUp.tightenLimits(BIMCreditTopUp.Limits(PER_PAYMENT, 2_000_00, PER_ACCOUNT));
+        vm.warp(block.timestamp + 1 hours);
+        assertEq(topUp.availableUsdCentsToday(), uint256(2_000_00) / 24);
+        _payAs("after", keccak256("org-new"), 1_00);
+        assertTrue(topUp.settled("after"));
+    }
+
+    /// Frequent small payments (metered AI usage) must not stop the allowance from refilling.
+    function test_FrequentSmallPaymentsStillDrain() public {
+        uint256 t0 = block.timestamp;
+        for (uint256 i; i < 100; ++i) {
+            _payAs(bytes32(1_000 + i), ACCOUNT, 1);
+            vm.warp(block.timestamp + 5);
+        }
+        uint256 elapsed = block.timestamp - 5 - t0; // time between the first and the last payment
+        uint256 drainedCents = uint256(PER_ACCOUNT) * elapsed / 30 days;
+        assertGt(drainedCents, 90);
+        assertGe(topUp.availableUsdCentsForAccount(ACCOUNT), PER_ACCOUNT - 100 + drainedCents - 1);
+    }
+
+    function test_GuardianRevokesRelayer() public {
+        _grantRelayer();
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.NotGuardianOrAdmin.selector, attacker));
+        topUp.revokeRelayer(relayer);
+        vm.prank(guardian);
+        topUp.revokeRelayer(relayer);
+        assertFalse(topUp.hasRole(topUp.RELAYER_ROLE(), relayer));
+        BIMCreditTopUp.Quote memory q = _quote("o1", 100e18, 10_000);
+        bytes memory sig = _sign(q);
+        (uint8 v, bytes32 r, bytes32 s) = _permit(100e18, q.expiresAt);
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.NotPayer.selector, relayer, payer));
+        topUp.payWithPermit(q, sig, 100e18, q.expiresAt, v, r, s);
+    }
+
+    /// A relayer can only submit a permit for exactly the quote's amount, expiring with the quote.
+    function test_RevertWhen_RelayerPermitDoesNotMatchQuote() public {
+        _grantRelayer();
+        BIMCreditTopUp.Quote memory q = _quote("o1", 100e18, 10_000);
+        bytes memory sig = _sign(q);
+        (uint8 v, bytes32 r, bytes32 s) = _permit(200e18, q.expiresAt);
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.PermitNotBoundToQuote.selector, 200e18, q.expiresAt));
+        topUp.payWithPermit(q, sig, 200e18, q.expiresAt, v, r, s);
+        (v, r, s) = _permit(100e18, q.expiresAt + 1);
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(BIMCreditTopUp.PermitNotBoundToQuote.selector, 100e18, q.expiresAt + 1));
+        topUp.payWithPermit(q, sig, 100e18, q.expiresAt + 1, v, r, s);
     }
 
     function test_RevenueSafeValidation() public {
@@ -851,19 +1001,22 @@ contract Handler is Test {
         try topUp.setMinBimPerUsd(newFloor) {} catch {}
     }
 
+    /// Levels in cent-seconds, like the contract, but computed independently.
     function _recordCaps(bytes32 accountRef, uint64 cents) internal {
         (, uint64 perDay, uint64 perAccount) = topUp.limits();
-        modelDayLevel = _drain(modelDayLevel, modelDayAt, perDay, 1 days) + cents;
+        modelDayLevel = _drain(modelDayLevel, modelDayAt, perDay, 1 days) + uint256(cents) * 1 days;
         modelDayAt = block.timestamp;
-        if (modelDayLevel > perDay) ghostDailyOverCap = true;
-        modelAccountLevel[accountRef] =
-            _drain(modelAccountLevel[accountRef], modelAccountAt[accountRef], perAccount, 30 days) + cents;
+        if (modelDayLevel > uint256(perDay) * 1 days) ghostDailyOverCap = true;
+        modelAccountLevel[accountRef] = _drain(
+            modelAccountLevel[accountRef], modelAccountAt[accountRef], perAccount, 30 days
+        ) + uint256(cents) * 30 days;
         modelAccountAt[accountRef] = block.timestamp;
-        if (modelAccountLevel[accountRef] > perAccount) ghostAccountOverCap = true;
+        if (modelAccountLevel[accountRef] > uint256(perAccount) * 30 days) ghostAccountOverCap = true;
     }
 
     function _drain(uint256 level, uint256 at, uint256 cap, uint256 window) internal view returns (uint256) {
-        uint256 drained = cap * (block.timestamp - at) / window;
+        if (level > cap * window) level = cap * window;
+        uint256 drained = cap * (block.timestamp - at);
         return level > drained ? level - drained : 0;
     }
 }

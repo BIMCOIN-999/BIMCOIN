@@ -59,50 +59,58 @@ On Solana the same rules apply to each payment:
    the dollar amount at the current market price and signs a 15-minute quote: "this wallet pays
    exactly N BIMCOIN for $X of credit".
 2. The customer submits the quote with `pay`, or with `payWithPermit`, which the customer or an
-   approved relayer (`RELAYER_ROLE`) can send so the customer pays no gas. The BIMCOIN moves
-   straight from the customer to the revenue Safe; the contract never holds it.
+   approved relayer (`RELAYER_ROLE`) can send so the customer pays no gas. A relayer must submit
+   a permit for exactly the quote's amount that expires no later than the quote. The BIMCOIN
+   moves straight from the customer to the revenue Safe; the contract never holds it.
 3. The backend credits the account only when a `PaymentSettled` event's `orderId`, `accountRef`,
    `payer`, `bimAmount` and `usdCents` all match a quote it stored, and credits exactly the
    event's `usdCents`. On any mismatch it credits nothing, alerts, and revokes the quote signer.
 
 ### What the contract enforces
 
-- **Floor.** No quote settles below `minBimPerUsd` BIMCOIN per $1 of list price, so a leaked
-  quote-signing key cannot sell credit for less. The floor is a safety net, not the price: set it
-  from the market price at deployment with a margin. When BIMCOIN trades above the price the
-  floor implies, BIMCOIN payers pay more than the USD list price until governance lowers the
-  floor, so the backend quotes the larger of the market amount and `minimumBimFor(usdCents)`.
-- **Single use.** Each `orderId` settles once. A guardian can `cancelOrder` one open quote, for
-  example after the price moves, without pausing everyone.
-- **Caps**, in US cents: per payment, per day across all accounts, and per account per 30 days.
-  The daily and account caps drain continuously (leaky buckets), so there is no double
-  allowance just after midnight. Read `availableUsdCentsToday()` and
-  `availableUsdCentsForAccount()` before quoting. Keep each account's cap below the daily cap,
-  or one customer can block everyone for a day.
+- **Floor.** No payment settles below `minBimPerUsd` BIMCOIN per $1 of list price, so a leaked
+  quote-signing key cannot settle a payment for less. It does not protect the backend's own
+  credit ledger. The floor is a safety net, not the price: set it a little below the market
+  amount. When BIMCOIN trades above the price the floor implies, BIMCOIN payers pay more than
+  the USD list price until governance lowers the floor, so the backend quotes the larger of the
+  market amount and `minimumBimFor(usdCents)`.
+- **Single use.** Each `orderId` settles once. A guardian can `cancelOrder` open quotes, for
+  example after the price moves, without pausing everyone. Cancelling an order that has already
+  settled does nothing, so a batch of cancellations still goes through.
+- **Caps**, in US cents: per payment, a daily cap across all accounts, and a per-account cap over
+  30 days. The daily and account caps are leaky buckets: each payment fills the bucket and it
+  drains at cap/window per second. A burst never exceeds the cap and there is no fresh
+  allowance at midnight, but over a full window just under 2x the cap can settle, so set each
+  cap to half the exposure you accept per window. Lowering a cap takes effect at once. Read
+  `availableUsdCentsToday()` and `availableUsdCentsForAccount()` before quoting. Keep each
+  account's cap below the daily cap, or one customer can use up a whole day.
 - **Clock tolerance.** A quote may be issued up to 60 seconds ahead of the chain's clock.
 
 ### Governance
 
 The contract's admin is a 48-hour `TimelockController` run by the governance Safe. Guardians
-(the ops Safe) can only stop things: pause, revoke the quote signer, cancel an order, lower the
-caps. Unpausing, raising caps, rotating the signer or revenue Safe, and granting relayers all
-take 48 hours, so launch caps must already cover peak demand.
+(the ops Safe) can only stop things: pause, revoke the quote signer or a relayer, cancel orders,
+lower the caps. Unpausing, raising caps, rotating the signer or revenue Safe, and granting
+relayers all take 48 hours, so launch caps must already cover peak demand.
 
-The floor can rise at most 2x once every 7 days, and fall at most 30% once every 30 days. Within
-90 days of a raise it can be returned to any value at or above the floor before that raise.
+The floor can rise at most 2x once every 7 days, and fall at most 30% once every 7 days. Within
+90 days of the latest raise it can be returned to any value at or above the lowest floor before
+that series of raises, so a multi-step defensive raise can be undone in one step.
 
 ### Deploy
 
-`MIN_BIM_PER_USD` is required: the floor in BIMCOIN wei (18 decimals) per US$1 of list price.
-Set it below the market amount. For example, with BIMCOIN at $0.50 the market amount is
-2 BIMCOIN per $1; a floor of `1600000000000000000` (1.6) lets the price rise 25% before the floor
-binds, and limits what a compromised backend could undercharge to 20%. The script
-refuses a token address with no code, a quote signer that is a contract or reuses a Safe, Safe
-addresses without code (unless `ALLOW_EOA_SAFES=true`, for testnets), and inconsistent caps.
+`MARKET_BIM_PER_USD` and `MIN_BIM_PER_USD` are required, both in BIMCOIN wei (18 decimals) per
+US$1 of list price: the market amount at deployment, and the floor, which must lie between 50%
+and 100% of it. For example, with BIMCOIN at $0.50 the market amount is 2 BIMCOIN per $1; a floor
+of `1600000000000000000` (1.6) lets the price rise 25% before the floor binds, and limits what a
+leaked quote-signing key could undercharge to 20%. The script refuses zero or code-less Safe
+addresses (code-less only allowed with `ALLOW_EOA_SAFES=true`, for testnets), a token address
+with no code or without 18 decimals, a quote signer that is a contract or reuses a Safe, and
+inconsistent caps.
 
 ```sh
 export BIMCOIN_ADDRESS=0x... GOVERNANCE_SAFE=0x... OPS_SAFE=0x... QUOTE_SIGNER=0x... REVENUE_SAFE=0x...
-export MIN_BIM_PER_USD=1600000000000000000
+export MARKET_BIM_PER_USD=2000000000000000000 MIN_BIM_PER_USD=1600000000000000000
 forge script script/DeployBIMCreditTopUp.s.sol --rpc-url base_sepolia --account deployer --broadcast
 ```
 
